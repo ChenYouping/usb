@@ -194,7 +194,8 @@ final class TcpChannelTester: ObservableObject {
                     return
                 }
                 let status = Int(bytes[4])
-                let length = Int(bytes[5]) | (Int(bytes[6]) << 8) | (Int(bytes[7]) << 16) | (Int(bytes[8]) << 24)
+                // DiPlay writes the length with Java DataOutputStream.writeInt (big-endian).
+                let length = (Int(bytes[5]) << 24) | (Int(bytes[6]) << 16) | (Int(bytes[7]) << 8) | Int(bytes[8])
                 guard length >= 0, length <= 4 * 1024 * 1024 else {
                     completion(.failure(ProbeError("响应长度异常：\(length)")))
                     return
@@ -244,10 +245,11 @@ final class TcpChannelTester: ObservableObject {
         frame.append(contentsOf: magicRequest)
         frame.append(op)
         let n = UInt32(body.count)
-        frame.append(UInt8(truncatingIfNeeded: n))
-        frame.append(UInt8(truncatingIfNeeded: n >> 8))
-        frame.append(UInt8(truncatingIfNeeded: n >> 16))
+        // Big-endian, matching Java DataInputStream.readInt on the DiPlay side.
         frame.append(UInt8(truncatingIfNeeded: n >> 24))
+        frame.append(UInt8(truncatingIfNeeded: n >> 16))
+        frame.append(UInt8(truncatingIfNeeded: n >> 8))
+        frame.append(UInt8(truncatingIfNeeded: n))
         frame.append(contentsOf: body)
         return frame
     }
