@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var port: String = "7100"
     @State private var showCopied = false
     @StateObject private var tester = ConnectionTester()
+    @StateObject private var tcpTester = TcpChannelTester()
 
     private var candidates: [InterfaceEntry] {
         entries.filter(InterfaceProbe.isCandidate)
@@ -90,6 +91,39 @@ struct ContentView: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
+                }
+
+                Section(header: Text("TCP 通道测速（需带通道的 DiPlay）")) {
+                    if let candidate = candidates.first {
+                        Text("目标 fe80::2:\(7100) · 接口 \(candidate.name)")
+                            .font(.system(.caption, design: .monospaced))
+                        Button(action: {
+                            tcpTester.run(interface: candidate.name)
+                        }) {
+                            HStack {
+                                Text("测速（1KB / 16KB / 64KB / 256KB 回环）")
+                                if tcpTester.isRunning { ProgressView() }
+                            }
+                        }
+                        .disabled(tcpTester.isRunning)
+                        HStack {
+                            Text(tcpTester.log)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                            Spacer()
+                            if tcpTester.isRunning {
+                                Button("停止") { tcpTester.cancel() }
+                            }
+                        }
+                        Text("只有把 DiPlay 换成带 TCP 通道的构建版本后才有 7100 端口；官方 APK 没有这个端口。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("没找到 NCM 接口，先跑 CarPlay 再重新扫描")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 Section(header: Text("手动连通性测试")) {
