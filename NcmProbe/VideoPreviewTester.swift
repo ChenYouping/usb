@@ -517,6 +517,10 @@ final class VideoPreviewTester: ObservableObject {
         // single-NALU frame that discarded the entire picture, leaving frame 0.
         // splitAnnexB extends the last NALU to the end of the buffer correctly.
         let nalus = splitAnnexB(data)
+        // If no Annex-B start code was found, the payload is already length-prefixed
+        // (AVCC/HVCC) — pass it through unchanged instead of returning empty. This
+        // keeps decoding working even if a server sends the other framing format.
+        if nalus.isEmpty { return data }
         var out = Data()
         for nalu in nalus {
             let len = nalu.count
