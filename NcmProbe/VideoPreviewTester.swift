@@ -13,6 +13,8 @@ final class VideoPreviewTester: ObservableObject {
     @Published private(set) var lastError = ""
     @Published private(set) var latestImage: CVPixelBuffer?
     @Published private(set) var step = "idle"
+    /// Decode diagnostics: frames submitted, decode return codes, callback status.
+    @Published private(set) var decodeDiag = ""
 
     /// The VT callback gets an opaque refCon; using a weak static avoids the
     /// dangling-pointer risk of Unmanaged.passUnretained after invalidation.
@@ -33,6 +35,10 @@ final class VideoPreviewTester: ObservableObject {
     private var wanted = false
     private var generation = 0
     private var frameIndex: Int64 = 0
+    private var submitted = 0          // frames actually handed to the decoder
+    private var lastDecodeStatus: OSStatus = 0
+    @Published private(set) var callbackCount = 0
+    @Published private(set) var lastCallback = ""
 
     var isConnected: Bool { connection != nil }
 
@@ -128,6 +134,9 @@ final class VideoPreviewTester: ObservableObject {
         }
         formatDesc = nil
         frameIndex = 0
+        submitted = 0
+        callbackCount = 0
+        lastCallback = ""
         clearBuffer()
     }
 
@@ -335,9 +344,13 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private let outputCallback: VTDecompressionOutputCallback = { _, _, status, _, image, _, _ in
-        guard status == noErr, let image else { return }
+        let code = status
+        let hasImage = image != nil
         guard let tester = VideoPreviewTester.active else { return }
         DispatchQueue.main.async {
+            tester.callbackCount += 1
+            tester.lastCallback = "回调#\(tester.callbackCount) status=\(code) 图像=\(hasImage)"
+            guard code == noErr, let image else { return }
             tester.latestImage = image
             tester.decodedFrames += 1
         }
@@ -353,8 +366,12 @@ final class VideoPreviewTester: ObservableObject {
             publish { self.detail = "等配置帧…（已收 \(annexb.count) 字节，NALU: \(kinds)）" }
             return
         }
+        let kinds = Self.naluTypeSummary(annexb)
         let prefixed = Self.annexBToLengthPrefixed(annexb, lengthSize: nalLengthSize)
-        guard !prefixed.isEmpty else { return }
+        guard !prefixed.isEmpty else {
+            publish { self.decodeDiag = "帧转码后为空（\(kinds)）" }
+            return
+        }
 
         // Allocate block buffer memory owned by the buffer, then copy bytes in.
         var block: CMBlockBuffer?
@@ -420,6 +437,12 @@ final class VideoPreviewTester: ObservableObject {
             frameRefcon: nil,
             infoFlagsOut: nil
         )
+        submitted += 1
+        lastDecodeStatus = dst
+        let sub = submitted, cb = callbackCount, st = dst
+        publish {
+            self.decodeDiag = "已送解码 \(sub) 帧 / 回调 \(cb) 次 / 上次 decode=\(st) / 帧头 \(kinds)"
+        }
         if dst != noErr { publish { self.lastError = "解码失败：\(dst)" } }
     }
 

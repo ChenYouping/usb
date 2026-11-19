@@ -174,6 +174,16 @@ struct ContentView: View {
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
+                        if !video.decodeDiag.isEmpty {
+                            Text(video.decodeDiag)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.blue)
+                        }
+                        if !video.lastCallback.isEmpty {
+                            Text(video.lastCallback)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.blue)
+                        }
                         if !video.lastError.isEmpty {
                             Text(video.lastError)
                                 .font(.system(.caption2, design: .monospaced))
