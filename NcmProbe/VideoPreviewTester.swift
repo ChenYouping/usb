@@ -4,6 +4,59 @@ import VideoToolbox
 import CoreMedia
 import CoreVideo
 
+/// 5-second windowed counters, mirrored field-for-field with DiPlay's NPVS-STAT
+/// so the two sides can be compared in one glance. Emitted even when idle, so a
+/// silent upstream (in=0f) is distinguishable from a frozen UI.
+private final class ProbeStats {
+    // Called from readQueue, main and the STAT timer queue — guard all state.
+    private let lock = NSLock()
+    private var start = Date()
+    private var inBytes = 0
+    private var parsedCfg = 0, parsedFrame = 0
+    private var resync = 0, badLen = 0
+    private var cfgApplied = 0, cfgFail = 0
+    private var transEmpty = 0, transFrames = 0
+    private var submitted = 0, submitFail = 0
+    private var decOK = 0, decFail = 0
+    private var shown = 0
+    private var reconnect = 0
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock(); defer { lock.unlock() }; return body()
+    }
+
+    func chunk(_ bytes: Int) { withLock { inBytes += bytes } }
+    func parsed(kind: UInt8) { withLock { if kind == 1 { parsedCfg += 1 } else { parsedFrame += 1 } } }
+    func didResync() { withLock { resync += 1 } }
+    func badLength() { withLock { badLen += 1 } }
+    func config(applied: Bool) { withLock { if applied { cfgApplied += 1 } else { cfgFail += 1 } } }
+    func transcoded(empty: Bool) { withLock { if empty { transEmpty += 1 } else { transFrames += 1 } } }
+    func didSubmit(ok: Bool) { withLock { if ok { submitted += 1 } else { submitFail += 1 } } }
+    func decoded(ok: Bool) { withLock { if ok { decOK += 1 } else { decFail += 1 } } }
+    func didShow() { withLock { shown += 1 } }
+    func didReconnect() { withLock { reconnect += 1 } }
+
+    /// Returns the STAT line when the 5 s window elapsed, otherwise nil.
+    func flush() -> String? {
+        withLock {
+            let now = Date()
+            let span = now.timeIntervalSince(start)
+            guard span >= 5.0 else { return nil }
+            let line = String(format:
+                "PROBE-STAT win=%.1fs in=%dkB parse=%d/%d resync=%d badLen=%d " +
+                "cfg=%d/%d trans=%d/empty%d submit=%d/fail%d dec=%d/fail%d shown=%d recon=%d",
+                span, inBytes / 1024, parsedCfg, parsedFrame, resync, badLen,
+                cfgApplied, cfgFail, transFrames, transEmpty, submitted, submitFail,
+                decOK, decFail, shown, reconnect)
+            start = now
+            inBytes = 0; parsedCfg = 0; parsedFrame = 0
+            resync = 0; badLen = 0; cfgApplied = 0; cfgFail = 0
+            transEmpty = 0; transFrames = 0; submitted = 0; submitFail = 0
+            decOK = 0; decFail = 0; shown = 0; reconnect = 0
+            return line
+        }
+    }
+}
+
 /// Receives the NPVS stream from DiPlay's VideoFrameRelay (port 7101) and decodes
 /// the Annex-B H.264/H.265 frames with VideoToolbox into CVPixelBuffers.
 final class VideoPreviewTester: ObservableObject {
@@ -52,6 +105,10 @@ final class VideoPreviewTester: ObservableObject {
     private var stallWorkItem: DispatchWorkItem?
     private static let stallTimeout: Double = 6.0
 
+    // Windowed observability counters + 5 s heartbeat timer.
+    private let stats = ProbeStats()
+    private var statTimer: DispatchSourceTimer?
+
     var isConnected: Bool { connection != nil }
 
     private func publish(_ body: @escaping () -> Void) {
@@ -64,13 +121,16 @@ final class VideoPreviewTester: ObservableObject {
     private var lastInterface: String = ""
     private var consecutiveDecodeErrors = 0
     private var lastReconnect = Date.distantPast
+    private var waitConfigWarnCount = 0
 
     func connect(interface: String) {
         lastInterface = interface
         consecutiveDecodeErrors = 0
+        waitConfigWarnCount = 0
         DiagLog.shared.reset()
-        DiagLog.shared.line("=== connect start iface=\(interface) ===")
+        DiagLog.shared.evt("connect start iface=\(interface)")
         disconnect()
+        startStatTimer()
         wanted = true
         generation += 1
         let gen = generation
@@ -105,7 +165,7 @@ final class VideoPreviewTester: ObservableObject {
                 guard gen == self.generation, self.wanted else { return }
                 switch state {
                 case .ready:
-                    DiagLog.shared.line("TCP ready (attempt \(attempt))")
+                    DiagLog.shared.evt("TCP ready attempt=\(attempt) gen=\(gen)")
                     self.lastError = ""
                     self.status = "已连接，等待首帧"
                     self.mark("ready - waiting frame")
@@ -120,7 +180,7 @@ final class VideoPreviewTester: ObservableObject {
                     self.detail = "\(err)"
                     self.mark("waiting: \(err)")
                 case .failed(let err):
-                    DiagLog.shared.line("TCP failed attempt \(attempt): \(err)")
+                    DiagLog.shared.warn("TCP failed attempt=\(attempt) gen=\(gen) err=\(err)")
                     self.teardownConnection()
                     if attempt + 1 < maxAttempts {
                         self.mark("连接失败，1 秒后重试：\(err)")
@@ -147,8 +207,11 @@ final class VideoPreviewTester: ObservableObject {
     func disconnect() {
         wanted = false
         generation += 1
+        stopStatTimer()
+        if let line = stats.flush() { DiagLog.shared.stat(line) }
         teardownConnection()
         Self.active = nil
+        DiagLog.shared.evt("disconnect")
         publish { self.status = "未连接" }
     }
 
@@ -186,6 +249,7 @@ final class VideoPreviewTester: ObservableObject {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
+                self.stats.chunk(data.count)
                 self.readQueue.async {
                     self.readBuffer.append(contentsOf: data)
                     self.parseFrames()
@@ -194,10 +258,12 @@ final class VideoPreviewTester: ObservableObject {
                 }
             }
             if let error {
+                DiagLog.shared.warn("recv error gen=\(self.generation) err=\(error)")
                 self.publish { self.lastError = "收流错误：\(error)" }
                 return
             }
             if isComplete {
+                DiagLog.shared.evt("recv isComplete gen=\(self.generation) (peer closed)")
                 self.publish {
                     self.status = "对端关闭"
                     self.teardownConnection()
@@ -215,6 +281,7 @@ final class VideoPreviewTester: ObservableObject {
             guard readBuffer[0] == 0x4E, readBuffer[1] == 0x50,
                   readBuffer[2] == 0x56, readBuffer[3] == 0x53 else {
                 readBuffer.removeFirst()
+                stats.didResync()
                 continue
             }
             let kind = readBuffer[4]
@@ -224,6 +291,8 @@ final class VideoPreviewTester: ObservableObject {
                          (Int(readBuffer[8]) << 8) | Int(readBuffer[9])
             guard length <= 32 * 1024 * 1024 else {
                 readBuffer.removeAll(keepingCapacity: true)
+                stats.badLength()
+                DiagLog.shared.warn("badLen len=\(length) buf=\(readBuffer.count) resynced")
                 publish { self.lastError = "帧长度异常：\(length)，已重新同步" }
                 return
             }
@@ -231,6 +300,7 @@ final class VideoPreviewTester: ObservableObject {
             guard readBuffer.count >= total else { break }  // wait for rest of frame
             let body = Array(readBuffer[headerSize..<total])
             readBuffer.removeFirst(total)
+            stats.parsed(kind: kind)
             if kind == 1 {
                 mark("解析配置帧 \(length)B")
                 applyConfig(codec: codec, data: Data(body))
@@ -242,21 +312,22 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private func applyConfig(codec: UInt8, data: Data) {
-        DiagLog.shared.line("CONFIG frame codec=\(codec) bytes=\(data.count)")
+        DiagLog.shared.evt("CONFIG codec=\(codec) bytes=\(data.count)")
         mark("apply config \(data.count)B")
         // H264 avcC keeps lengthSizeMinusOne at byte 4; H265 hvcC keeps it at
         // byte 21. Reading byte 4 for hvcC returns profile flags -> bogus size 1.
         nalLengthSize = Self.nalLengthSize(from: data, codec: codec)
-        DiagLog.shared.line("  nalLengthSize=\(nalLengthSize)")
         guard let desc = Self.formatDescription(from: data, codec: codec) else {
-            DiagLog.shared.line("  FAIL formatDescription=nil")
+            stats.config(applied: false)
+            DiagLog.shared.warn("CONFIG fail codec=\(codec) bytes=\(data.count) fmtDesc=nil")
             publish { self.lastError = "无法从配置帧构造格式描述" }
             return
         }
+        stats.config(applied: true)
         formatDesc = desc
         mark("format desc ok - create session")
         recreateSession()
-        DiagLog.shared.line("  sessionCreated=\(session != nil)")
+        DiagLog.shared.evt("CONFIG applied codec=\(codec) nalLen=\(nalLengthSize) session=\(session != nil)")
         if session != nil {
             publish {
                 self.detail = "配置：\(codec == 1 ? "H265" : "H264")，NAL 长度 \(self.nalLengthSize) 字节"
@@ -380,23 +451,24 @@ final class VideoPreviewTester: ObservableObject {
 
     private let outputCallback: VTDecompressionOutputCallback = { _, _, status, _, image, _, _ in
         let code = status
-        let hasImage = image != nil
-        DiagLog.shared.line("DECODE callback status=\(code) image=\(hasImage)")
         guard let tester = VideoPreviewTester.active else { return }
         DispatchQueue.main.async {
             tester.callbackCount += 1
             if code != noErr || image == nil {
+                tester.stats.decoded(ok: false)
                 // watchdog: a long unbroken run of decode failures means the
-                // reference chain is broken with no upcoming IDR (e.g. a bad
-                // GOP replay seam). Reconnect makes the server replay a fresh
-                // complete GOP, which self-heals the decoder.
+                // reference chain is broken with no upcoming IDR. Reconnect makes
+                // the server replay a fresh GOP, which self-heals the decoder.
                 tester.consecutiveDecodeErrors += 1
+                if tester.consecutiveDecodeErrors == 1 || tester.consecutiveDecodeErrors % 60 == 0 {
+                    DiagLog.shared.warn("decodeFail status=\(code) streak=\(tester.consecutiveDecodeErrors)")
+                }
                 if tester.consecutiveDecodeErrors == 60 {
-                    DiagLog.shared.line("60 consecutive decode errors -> auto reconnect")
-                    tester.reconnectForRecovery()
+                    tester.reconnectForRecovery(reason: "decode")
                 }
                 return
             }
+            tester.stats.decoded(ok: true)
             tester.consecutiveDecodeErrors = 0
             guard let image else { return }
             // Coalesce: callbacks only overwrite the newest-frame slot. One
@@ -411,9 +483,28 @@ final class VideoPreviewTester: ObservableObject {
                     tester.pendingImage = nil
                     tester.latestImage = newest
                     tester.decodedFrames += 1
+                    tester.stats.didShow()
                 }
             }
         }
+    }
+
+    /// Emit a PROBE-STAT heartbeat every 5 s for the whole connection lifetime.
+    private func startStatTimer() {
+        stopStatTimer()
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        t.schedule(deadline: .now() + 5, repeating: 5)
+        t.setEventHandler { [weak self] in
+            guard let line = self?.stats.flush() else { return }
+            DiagLog.shared.stat(line)
+        }
+        t.resume()
+        statTimer = t
+    }
+
+    private func stopStatTimer() {
+        statTimer?.cancel()
+        statTimer = nil
     }
 
     /// (Re)arm the no-data watchdog. Called on every received chunk and once
@@ -422,7 +513,7 @@ final class VideoPreviewTester: ObservableObject {
         stallWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, gen == self.generation, self.wanted else { return }
-            DiagLog.shared.line("no data for \(Self.stallTimeout)s -> stall reconnect")
+            DiagLog.shared.warn("stall noData=${Self.stallTimeout}s gen=\(gen) -> reconnect")
             self.reconnectForRecovery(reason: "stall")
         }
         stallWorkItem = item
@@ -436,7 +527,8 @@ final class VideoPreviewTester: ObservableObject {
         let now = Date()
         if now.timeIntervalSince(lastReconnect) < 8 { return }
         lastReconnect = now
-        DiagLog.shared.line("=== auto reconnect (\(reason) watchdog) ===")
+        DiagLog.shared.evt("autoReconnect reason=\(reason) gen=\(generation)")
+        stats.didReconnect()
         consecutiveDecodeErrors = 0
         stallWorkItem?.cancel()
         stallWorkItem = nil
@@ -459,15 +551,22 @@ final class VideoPreviewTester: ObservableObject {
         if formatDesc == nil { _ = tryAdoptConfigFromFrame(annexb) }
         guard let desc = formatDesc, let session else {
             let kinds = Self.naluTypeSummary(annexb)
+            waitConfigWarnCount += 1
+            if waitConfigWarnCount == 1 || waitConfigWarnCount % 100 == 0 {
+                DiagLog.shared.warn("waitConfig n=\(waitConfigWarnCount) bytes=\(annexb.count) \(kinds)")
+            }
             publish { self.detail = "等配置帧…（已收 \(annexb.count) 字节，NALU: \(kinds)）" }
             return
         }
+        waitConfigWarnCount = 0
         let kinds = Self.naluTypeSummary(annexb)
         let prefixed = Self.annexBToLengthPrefixed(annexb, lengthSize: nalLengthSize)
         guard !prefixed.isEmpty else {
-            DiagLog.shared.line("FRAME transcode EMPTY \(kinds) raw=\(annexb.count)")
+            stats.transcoded(empty: true)
+            DiagLog.shared.warn("transEmpty raw=\(annexb.count) \(kinds)")
             return
         }
+        stats.transcoded(empty: false)
 
         // Allocate block buffer memory owned by the buffer, then copy bytes in.
         var block: CMBlockBuffer?
@@ -535,8 +634,16 @@ final class VideoPreviewTester: ObservableObject {
         )
         submitted += 1
         lastDecodeStatus = dst
-        DiagLog.shared.line("FRAME#\(submitted) \(kinds) prefixed=\(prefixed.count) decode=\(dst) callbacks=\(callbackCount)")
-        if dst != noErr { publish { self.lastError = "解码失败：\(dst)" } }
+        stats.didSubmit(ok: dst == noErr)
+        // TRACE: sample one frame per second instead of every frame, so a long
+        // session does not flood the log. Full counts live in PROBE-STAT.
+        if submitted % 30 == 0 || dst != noErr {
+            DiagLog.shared.line("TRACE frame#\(submitted) \(kinds) bytes=\(prefixed.count) decode=\(dst) cb=\(callbackCount)")
+        }
+        if dst != noErr {
+            DiagLog.shared.warn("decodeSubmitFail status=\(dst) frame#\(submitted)")
+            publish { self.lastError = "解码失败：\(dst)" }
+        }
     }
 
     /// Split an Annex-B stream into raw NALUs (without start codes).
