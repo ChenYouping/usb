@@ -2,6 +2,13 @@ import Foundation
 import Darwin
 import Network
 
+/// Lightweight error so Result's Failure type conforms to Error while keeping
+/// plain string interpolation (`\(msg)`) readable in the log.
+private struct ProbeError: Error, CustomStringConvertible {
+    let description: String
+    init(_ description: String) { self.description = description }
+}
+
 /// Raw TCP throughput tester against DiPlay's DiplayTcpChannel (port 7100).
 ///
 /// Wire protocol (must match the DiPlay side):
@@ -169,27 +176,27 @@ final class TcpChannelTester: ObservableObject {
         _ conn: NWConnection,
         frame: Data,
         queue: DispatchQueue,
-        completion: @escaping (Result<(Int, Data), String>) -> Void
+        completion: @escaping (Result<(Int, Data), ProbeError>) -> Void
     ) {
         conn.send(content: frame, contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { err in
             if let err = err {
-                completion(.failure("发送失败：\(err.localizedDescription)"))
+                completion(.failure(ProbeError("发送失败：\(err.localizedDescription)")))
                 return
             }
             Self.readExactly(conn, count: 9, queue: queue) { header in
                 guard let header = header else {
-                    completion(.failure("读取响应头超时或连接关闭"))
+                    completion(.failure(ProbeError("读取响应头超时或连接关闭")))
                     return
                 }
                 let bytes = [UInt8](header)
                 guard Array(bytes[0..<4]) == Self.magicResponse else {
-                    completion(.failure("响应 magic 不符"))
+                    completion(.failure(ProbeError("响应 magic 不符")))
                     return
                 }
                 let status = Int(bytes[4])
                 let length = Int(bytes[5]) | (Int(bytes[6]) << 8) | (Int(bytes[7]) << 16) | (Int(bytes[8]) << 24)
                 guard length >= 0, length <= 4 * 1024 * 1024 else {
-                    completion(.failure("响应长度异常：\(length)"))
+                    completion(.failure(ProbeError("响应长度异常：\(length)")))
                     return
                 }
                 if length == 0 {
@@ -198,7 +205,7 @@ final class TcpChannelTester: ObservableObject {
                 }
                 Self.readExactly(conn, count: length, queue: queue) { body in
                     guard let body = body else {
-                        completion(.failure("读取响应体超时或连接关闭"))
+                        completion(.failure(ProbeError("读取响应体超时或连接关闭")))
                         return
                     }
                     completion(.success((status, body)))
