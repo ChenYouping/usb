@@ -1,0 +1,10 @@
+DerivedData/
+Payload/
+build/
+*.ipa
+*.zip
+.DS_Store
+*.xcuserstate
+xcuserdata/
+*.xcuserdatad
+*.swiftpm/
