@@ -53,14 +53,23 @@ final class VideoPreviewTester: ObservableObject {
             self.detail = ""
             self.lastError = ""
         }
-        mark("resolve endpoint")
+        establish(interface: interface, gen: gen, attempt: 0)
+    }
+
+    /// The 7101 push server is started together with the CarPlay session and can be
+    /// briefly unavailable (ECONNABORTED / errno 53) right after a reconnect. Retry a
+    /// few times so the user doesn't have to time the tap perfectly.
+    private func establish(interface: String, gen: Int, attempt: Int) {
+        guard gen == self.generation, self.wanted else { return }
+        let maxAttempts = 6
+        mark(attempt == 0 ? "解析端点" : "重试连接 \(attempt)/\(maxAttempts - 1)")
         guard let port = NWEndpoint.Port(rawValue: 7101) else {
             publish { self.lastError = "端口无效" }
             return
         }
         let host = NWEndpoint.Host("fe80::2%\(interface)")
         let endpoint = NWEndpoint.hostPort(host: host, port: port)
-        mark("create connection")
+        mark("创建连接 \(attempt)")
         let conn = NWConnection(to: endpoint, using: .tcp)
         connection = conn
         conn.stateUpdateHandler = { [weak self] state in
@@ -69,6 +78,7 @@ final class VideoPreviewTester: ObservableObject {
                 guard gen == self.generation, self.wanted else { return }
                 switch state {
                 case .ready:
+                    self.lastError = ""
                     self.status = "已连接，等待首帧"
                     self.mark("ready - waiting frame")
                     self.clearBuffer()
@@ -78,10 +88,18 @@ final class VideoPreviewTester: ObservableObject {
                     self.detail = "\(err)"
                     self.mark("waiting: \(err)")
                 case .failed(let err):
-                    self.lastError = "连接失败：\(err)"
-                    self.status = "失败"
-                    self.mark("failed: \(err)")
                     self.teardownConnection()
+                    if attempt + 1 < maxAttempts {
+                        self.mark("连接失败，1 秒后重试：\(err)")
+                        let delay = DispatchTime.now() + 1.0
+                        DispatchQueue.main.asyncAfter(deadline: delay) { [weak self] in
+                            self?.establish(interface: interface, gen: gen, attempt: attempt + 1)
+                        }
+                    } else {
+                        self.lastError = "连接失败（已重试 \(attempt) 次）：\(err)"
+                        self.status = "失败"
+                        self.mark("failed: \(err)")
+                    }
                 case .cancelled:
                     self.status = "已断开"
                 default:
@@ -89,7 +107,7 @@ final class VideoPreviewTester: ObservableObject {
                 }
             }
         }
-        mark("start connection")
+        mark("启动连接 \(attempt)")
         conn.start(queue: readQueue)
     }
 
