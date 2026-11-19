@@ -37,6 +37,13 @@ final class VideoPreviewTester: ObservableObject {
     private var submitted = 0          // frames actually handed to the decoder
     private var lastDecodeStatus: OSStatus = 0
     private var callbackCount = 0
+    // While the app is backgrounded the main queue is frozen but the decode
+    // thread keeps producing frames, so many "latestImage =" closures pile up.
+    // Coalesce them: callbacks only overwrite a pending slot, and a single
+    // scheduled refresh publishes just the newest frame. This prevents a burst
+    // of stale frames flashing by when returning to the foreground.
+    private var pendingImage: CVPixelBuffer?
+    private var displayRefreshScheduled = false
 
     var isConnected: Bool { connection != nil }
 
@@ -138,6 +145,7 @@ final class VideoPreviewTester: ObservableObject {
         frameIndex = 0
         submitted = 0
         callbackCount = 0
+        pendingImage = nil
         clearBuffer()
     }
 
@@ -356,8 +364,20 @@ final class VideoPreviewTester: ObservableObject {
         DispatchQueue.main.async {
             tester.callbackCount += 1
             guard code == noErr, let image else { return }
-            tester.latestImage = image
-            tester.decodedFrames += 1
+            // Coalesce: callbacks only overwrite the newest-frame slot. One
+            // refresh is scheduled; when the main queue drains (e.g. back from
+            // background) only the latest frame is shown, not every stale one.
+            tester.pendingImage = image
+            if !tester.displayRefreshScheduled {
+                tester.displayRefreshScheduled = true
+                DispatchQueue.main.async {
+                    tester.displayRefreshScheduled = false
+                    guard let newest = tester.pendingImage else { return }
+                    tester.pendingImage = nil
+                    tester.latestImage = newest
+                    tester.decodedFrames += 1
+                }
+            }
         }
     }
 
