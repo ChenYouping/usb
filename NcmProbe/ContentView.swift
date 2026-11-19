@@ -166,6 +166,9 @@ struct ContentView: View {
                         }
                         Text("状态：\(video.status)")
                             .font(.system(.caption2, design: .monospaced))
+                        Text("步骤：\(video.step)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
                         if !video.detail.isEmpty {
                             Text(video.detail)
                                 .font(.system(.caption2, design: .monospaced))
