@@ -22,11 +22,17 @@ final class VideoPreviewTester: ObservableObject {
     private var session: VTDecompressionSession?
     private var formatDesc: CMFormatDescription?
     private var nalLengthSize: Int = 4
-    private var readBuffer = Data()
+
+    /// IMPORTANT: use a plain [UInt8] array, NOT Data. Data's integer subscript
+    /// is relative to startIndex, which can drift after repeated removeFirst()
+    /// and causes an out-of-bounds Swift trap inside parseFrames(). An array's
+    /// indices always start at 0 and stay contiguous after removeFirst.
+    private var readBuffer: [UInt8] = []
     private let readQueue = DispatchQueue(label: "npvs.read", qos: .userInitiated)
 
     private var wanted = false
     private var generation = 0
+    private var frameIndex: Int64 = 0
 
     var isConnected: Bool { connection != nil }
 
@@ -103,14 +109,15 @@ final class VideoPreviewTester: ObservableObject {
             session = nil
         }
         formatDesc = nil
+        frameIndex = 0
         clearBuffer()
     }
 
-    /// All readBuffer mutations must happen on readQueue. This prevents the
-    /// cross-thread race between the main thread (teardown/ready) and the
-    /// receive queue (append/parse) that caused an out-of-bounds trap.
+    /// All readBuffer mutations must happen on readQueue. Combined with the
+    /// [UInt8] backing store this removes both the cross-thread race and the
+    /// Data.startIndex drift that caused two separate out-of-bounds traps.
     private func clearBuffer() {
-        readQueue.async { self.readBuffer.removeAll() }
+        readQueue.async { self.readBuffer.removeAll(keepingCapacity: true) }
     }
 
     deinit {
@@ -124,7 +131,7 @@ final class VideoPreviewTester: ObservableObject {
             guard let self else { return }
             if let data, !data.isEmpty {
                 self.readQueue.async {
-                    self.readBuffer.append(data)
+                    self.readBuffer.append(contentsOf: data)
                     self.parseFrames()
                 }
             }
@@ -146,6 +153,7 @@ final class VideoPreviewTester: ObservableObject {
     private func parseFrames() {
         let headerSize = 10
         while readBuffer.count >= headerSize {
+            // Resync to the "NPVS" magic; array indices are always 0-based.
             guard readBuffer[0] == 0x4E, readBuffer[1] == 0x50,
                   readBuffer[2] == 0x56, readBuffer[3] == 0x53 else {
                 readBuffer.removeFirst()
@@ -153,20 +161,24 @@ final class VideoPreviewTester: ObservableObject {
             }
             let kind = readBuffer[4]
             let codec = readBuffer[5]
-            let length = Int(readBuffer[6]) << 24 | Int(readBuffer[7]) << 16 |
-                         Int(readBuffer[8]) << 8  | Int(readBuffer[9])
-            guard length >= 0, length <= 32 * 1024 * 1024 else {
-                readBuffer.removeAll()
+            // Big-endian 32-bit length. UInt8 -> Int shift is safe on 64-bit.
+            let length = (Int(readBuffer[6]) << 24) | (Int(readBuffer[7]) << 16) |
+                         (Int(readBuffer[8]) << 8) | Int(readBuffer[9])
+            guard length <= 32 * 1024 * 1024 else {
+                readBuffer.removeAll(keepingCapacity: true)
+                publish { self.lastError = "帧长度异常：\(length)，已重新同步" }
                 return
             }
-            guard readBuffer.count >= headerSize + length else { break }
-            let body = Data(readBuffer[headerSize..<(headerSize + length)])
-            readBuffer.removeFirst(headerSize + length)
-            // Already on readQueue; call directly so buffer work stays serialized.
+            let total = headerSize + length
+            guard readBuffer.count >= total else { break }  // wait for rest of frame
+            let body = Array(readBuffer[headerSize..<total])
+            readBuffer.removeFirst(total)
             if kind == 1 {
-                applyConfig(codec: codec, data: body)
+                mark("解析配置帧 \(length)B")
+                applyConfig(codec: codec, data: Data(body))
             } else if kind == 2 {
-                submitFrame(body)
+                mark("解析视频帧 \(length)B")
+                submitFrame(Data(body))
             }
         }
     }
@@ -297,14 +309,9 @@ final class VideoPreviewTester: ObservableObject {
     private let outputCallback: VTDecompressionOutputCallback = { _, _, status, _, image, _, _ in
         guard status == noErr, let image else { return }
         guard let tester = VideoPreviewTester.active else { return }
-        if Thread.isMainThread {
+        DispatchQueue.main.async {
             tester.latestImage = image
             tester.decodedFrames += 1
-        } else {
-            DispatchQueue.main.async {
-                tester.latestImage = image
-                tester.decodedFrames += 1
-            }
         }
     }
 
@@ -317,7 +324,6 @@ final class VideoPreviewTester: ObservableObject {
         guard !prefixed.isEmpty else { return }
 
         // Allocate block buffer memory owned by the buffer, then copy bytes in.
-        // The old version pointed at a temporary Data buffer (use-after-free).
         var block: CMBlockBuffer?
         let createStatus = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -349,9 +355,10 @@ final class VideoPreviewTester: ObservableObject {
         }
 
         var sample: CMSampleBuffer?
+        frameIndex += 1
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: 30),
-            presentationTimeStamp: CMTime(value: Int64(decodedFrames), timescale: 30),
+            presentationTimeStamp: CMTime(value: frameIndex, timescale: 30),
             decodeTimeStamp: .invalid
         )
         var size = prefixed.count
