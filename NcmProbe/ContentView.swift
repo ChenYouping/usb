@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import CoreImage
 
 struct ContentView: View {
     @State private var entries: [InterfaceEntry] = InterfaceProbe.scan()
@@ -8,6 +9,15 @@ struct ContentView: View {
     @State private var showCopied = false
     @StateObject private var tester = ConnectionTester()
     @StateObject private var tcpTester = TcpChannelTester()
+    @StateObject private var video = VideoPreviewTester()
+
+    private func uiImage(from pixel: CVPixelBuffer?) -> UIImage? {
+        guard let pixel else { return nil }
+        let ci = CIImage(cvPixelBuffer: pixel)
+        let context = CIContext()
+        guard let cg = context.createCGImage(ci, from: ci.extent) else { return nil }
+        return UIImage(cgImage: cg)
+    }
 
     private var candidates: [InterfaceEntry] {
         entries.filter(InterfaceProbe.isCandidate)
@@ -117,6 +127,56 @@ struct ContentView: View {
                             }
                         }
                         Text("只有把 DiPlay 换成带 TCP 通道的构建版本后才有 7100 端口；官方 APK 没有这个端口。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("没找到 NCM 接口，先跑 CarPlay 再重新扫描")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section(header: Text("视频预览（需带视频通道的 DiPlay · 端口 7101）")) {
+                    if let candidate = candidates.first {
+                        if let image = uiImage(from: video.latestImage) {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxWidth: 320)
+                                .cornerRadius(8)
+                                .background(Color.black)
+                        } else {
+                            Text("小窗口待机：连接后显示 CarPlay 画面")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 120)
+                        }
+                        HStack {
+                            if video.isConnected {
+                                Button("断开视频") { video.disconnect() }
+                            } else {
+                                Button("连接视频（fe80::2 · 7101）") {
+                                    video.connect(interface: candidate.name)
+                                }
+                            }
+                            Spacer()
+                            Text("帧 \(video.decodedFrames)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Text("状态：\(video.status)")
+                            .font(.system(.caption2, design: .monospaced))
+                        if !video.detail.isEmpty {
+                            Text(video.detail)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        if !video.lastError.isEmpty {
+                            Text(video.lastError)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.red)
+                        }
+                        Text("需要把 DiPlay 换成带视频通道的构建版本（端口 7101）；官方 APK 无此端口。点连接后才开始推流，断开即停。")
                             .font(.caption2)
                             .foregroundColor(.secondary)
                     } else {
