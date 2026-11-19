@@ -185,7 +185,9 @@ final class VideoPreviewTester: ObservableObject {
 
     private func applyConfig(codec: UInt8, data: Data) {
         mark("apply config \(data.count)B")
-        if data.count > 4 { nalLengthSize = Int(data[4] & 0x03) + 1 }
+        // H264 avcC keeps lengthSizeMinusOne at byte 4; H265 hvcC keeps it at
+        // byte 21. Reading byte 4 for hvcC returns profile flags -> bogus size 1.
+        nalLengthSize = Self.nalLengthSize(from: data, codec: codec)
         guard let desc = Self.formatDescription(from: data, codec: codec) else {
             publish { self.lastError = "无法从配置帧构造格式描述" }
             return
@@ -245,7 +247,7 @@ final class VideoPreviewTester: ObservableObject {
             offsets.append((contiguous.count, a.count))
             contiguous.append(contentsOf: a)
         }
-        let headerLength = Int32(nalLengthSizeFrom(data))
+        let headerLength = Int32(Self.nalLengthSize(from: data, codec: codec))
         // NSData keeps the backing bytes alive for the whole API call.
         let storage = contiguous as NSData
         let base = storage.bytes.assumingMemoryBound(to: UInt8.self)
@@ -280,9 +282,17 @@ final class VideoPreviewTester: ObservableObject {
         return out
     }
 
-    private static func nalLengthSizeFrom(_ data: Data) -> Int {
-        guard data.count > 4 else { return 4 }
-        return Int(data[4] & 0x03) + 1
+    /// avcC (H264): lengthSizeMinusOne lives at byte 4 (after 4-byte header).
+    /// hvcC (H265): configurationVersion(1) + general_profile/tier(1) +
+    /// compatibility(4) + constraint(6) + level(1) = 13, then reserved/minSpatial(2),
+    /// reserved/parallelism(1), reserved/chroma(1), reserved/lumaDepth(1),
+    /// reserved/chromaDepth(1), avgFrameRate(2) = 21 bytes, then the byte whose
+    /// low 2 bits are lengthSizeMinusOne at offset 21.
+    private static func nalLengthSize(from data: Data, codec: UInt8) -> Int {
+        let offset = codec == 1 ? 21 : 4
+        guard data.count > offset else { return 4 }
+        let v = Int(data[offset] & 0x03) + 1
+        return (v >= 1 && v <= 4) ? v : 4
     }
 
     private func recreateSession() {
