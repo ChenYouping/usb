@@ -53,7 +53,14 @@ final class VideoPreviewTester: ObservableObject {
 
     private func mark(_ s: String) { publish { self.step = s } }
 
+    // Last connected interface, kept so the decode-failure watchdog can reconnect.
+    private var lastInterface: String = ""
+    private var consecutiveDecodeErrors = 0
+    private var lastReconnect = Date.distantPast
+
     func connect(interface: String) {
+        lastInterface = interface
+        consecutiveDecodeErrors = 0
         DiagLog.shared.reset()
         DiagLog.shared.line("=== connect start iface=\(interface) ===")
         disconnect()
@@ -363,7 +370,20 @@ final class VideoPreviewTester: ObservableObject {
         guard let tester = VideoPreviewTester.active else { return }
         DispatchQueue.main.async {
             tester.callbackCount += 1
-            guard code == noErr, let image else { return }
+            if code != noErr || image == nil {
+                // watchdog: a long unbroken run of decode failures means the
+                // reference chain is broken with no upcoming IDR (e.g. a bad
+                // GOP replay seam). Reconnect makes the server replay a fresh
+                // complete GOP, which self-heals the decoder.
+                tester.consecutiveDecodeErrors += 1
+                if tester.consecutiveDecodeErrors == 60 {
+                    DiagLog.shared.line("60 consecutive decode errors -> auto reconnect")
+                    tester.reconnectForRecovery()
+                }
+                return
+            }
+            tester.consecutiveDecodeErrors = 0
+            guard let image else { return }
             // Coalesce: callbacks only overwrite the newest-frame slot. One
             // refresh is scheduled; when the main queue drains (e.g. back from
             // background) only the latest frame is shown, not every stale one.
@@ -378,6 +398,27 @@ final class VideoPreviewTester: ObservableObject {
                     tester.decodedFrames += 1
                 }
             }
+        }
+    }
+
+    /// Silent reconnect (keeps the diagnostic log) used by the decode-error
+    /// watchdog. The server replays a fresh GOP on connect, resetting the chain.
+    private func reconnectForRecovery() {
+        guard wanted, !lastInterface.isEmpty else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastReconnect) < 8 { return }
+        lastReconnect = now
+        DiagLog.shared.line("=== auto reconnect (decode watchdog) ===")
+        consecutiveDecodeErrors = 0
+        generation += 1
+        let gen = generation
+        teardownConnection()
+        Self.active = self
+        publish { self.status = "重连中…" }
+        // Brief pause so the server drops the old socket before we reconnect.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, gen == self.generation, self.wanted else { return }
+            self.establish(interface: self.lastInterface, gen: gen, attempt: 0)
         }
     }
 
