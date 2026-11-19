@@ -12,12 +12,14 @@ struct InterfaceEntry: Identifiable, Hashable {
 }
 
 enum InterfaceProbe {
-    // Interfaces iOS normally has on its own. Anything link-local outside
-    // this set is a candidate for the USB NCM / CarPlay link.
-    static let commonNames: Set<String> = [
-        "lo0", "en0", "en1", "en2", "awdl0", "llw0",
-        "pdp_ip0", "pdp_ip1", "bridge100",
-        "utun0", "utun1", "utun2", "utun3", "utun4"
+    // iOS normally has these on its own. Excluded by exact name or prefix.
+    // Note: en0 is Wi-Fi, but en2+ can be the USB NCM / CarPlay link — do NOT
+    // exclude the whole "en" family (an earlier version did and missed en2).
+    static let excludedNames: Set<String> = [
+        "lo0", "en0", "awdl0", "llw0", "bridge100"
+    ]
+    static let excludedPrefixes: [String] = [
+        "ipsec", "nan", "pdp_ip", "utun", "stf", "gif"
     ]
 
     static func scan() -> [InterfaceEntry] {
@@ -73,9 +75,17 @@ enum InterfaceProbe {
     }
 
     static func isCandidate(_ entry: InterfaceEntry) -> Bool {
-        entry.family == "IPv6"
-            && entry.isLinkLocal
-            && !commonNames.contains(entry.name)
+        if excludedNames.contains(entry.name) { return false }
+        if excludedPrefixes.contains(where: { entry.name.hasPrefix($0) }) { return false }
+        // Virtual tunnels and cellular links are P2P; the NCM link is a real
+        // Ethernet-style point-to-point with UP/RUNNING but not marked P2P.
+        if entry.flags.contains("P2P") || entry.flags.contains("LOOPBACK") { return false }
+        // The NCM interface shows up as a 169.254.x.x IPv4 link plus an fe80::
+        // IPv6 link-local on the same BSD interface (e.g. en2).
+        if entry.family == "IPv4" {
+            return entry.address.hasPrefix("169.254.")
+        }
+        return entry.isLinkLocal
     }
 
     static func report(_ entries: [InterfaceEntry]) -> String {

@@ -59,8 +59,32 @@ struct ContentView: View {
                     }
                 }
 
-                Section(header: Text("连通性测试")) {
-                    TextField("IPv6 地址或主机名", text: $host)
+                Section(header: Text("DiPlay 链路探测")) {
+                    if let candidate = candidates.first {
+                        Text("NCM 接口：\(candidate.name)  scope=\(candidate.scopeID)")
+                            .font(.system(.caption, design: .monospaced))
+                        Button(action: {
+                            tester.scanDiPlay(interface: candidate.name)
+                        }) {
+                            HStack {
+                                Text("扫描 DiPlay（fe80::2 · 端口 7000–7010）")
+                                if tester.isScanning { ProgressView() }
+                            }
+                        }
+                        .disabled(tester.isScanning)
+                    } else {
+                        Text("没找到 NCM 接口，先跑 CarPlay 再重新扫描")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Text(tester.log)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Section(header: Text("手动连通性测试")) {
+                    TextField("IPv6 地址或主机名（link-local 请带 %接口名）", text: $host)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                         .keyboardType(.URL)
@@ -73,13 +97,6 @@ struct ContentView: View {
                             tester.test(host: host, port: UInt16(port) ?? 7100)
                         }
                     }
-                    Text(tester.log)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                    Text("waiting 里出现 localNetworkDenied 表示本地网络权限没给；带 %enN 的 fe80 地址本工具只做扫描，连接测试请填不带 scope 的地址。")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
                 }
 
                 Section(header: Text("操作")) {
