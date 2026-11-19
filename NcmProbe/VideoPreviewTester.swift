@@ -133,6 +133,7 @@ final class VideoPreviewTester: ObservableObject {
     // Last connected interface, kept so the no-data watchdog can reconnect.
     private var lastInterface: String = ""
     private var lastReconnect = Date.distantPast
+    private var reconnectPending = false
     private var waitConfigWarnCount = 0
 
     func connect(interface: String) {
@@ -178,6 +179,7 @@ final class VideoPreviewTester: ObservableObject {
                 switch state {
                 case .ready:
                     DiagLog.shared.evt("TCP ready attempt=\(attempt) gen=\(gen)")
+                    self.reconnectPending = false
                     self.lastError = ""
                     self.status = "已连接，等待关键帧"
                     self.mark("ready - waiting IDR")
@@ -201,6 +203,8 @@ final class VideoPreviewTester: ObservableObject {
                             self?.establish(interface: interface, gen: gen, attempt: attempt + 1)
                         }
                     } else {
+                        self.reconnectPending = false
+                        self.awaitingKeyframe = true
                         self.lastError = "连接失败（已重试 \(attempt) 次）：\(err)"
                         self.status = "失败"
                         self.mark("failed: \(err)")
@@ -219,6 +223,7 @@ final class VideoPreviewTester: ObservableObject {
     func disconnect() {
         wanted = false
         generation += 1
+        reconnectPending = false
         stopStatTimer()
         if let line = stats.flush() { DiagLog.shared.stat(line) }
         teardownConnection()
@@ -529,7 +534,7 @@ final class VideoPreviewTester: ObservableObject {
         stallWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             guard let self, gen == self.generation, self.wanted else { return }
-            DiagLog.shared.warn("stall noData=${Self.stallTimeout}s gen=\(gen) -> reconnect")
+            DiagLog.shared.warn("stall noData=\(Self.stallTimeout)s gen=\(gen) -> reconnect")
             self.reconnectForRecovery(reason: "stall")
         }
         stallWorkItem = item
@@ -540,10 +545,15 @@ final class VideoPreviewTester: ObservableObject {
     /// watchdog now. On reconnect the server sends config and asks the iPhone for
     /// a fresh IDR; we start decoding when that IDR arrives.
     private func reconnectForRecovery(reason: String = "stall") {
-        guard wanted, !lastInterface.isEmpty else { return }
+        guard wanted, !lastInterface.isEmpty, !reconnectPending else { return }
         let now = Date()
-        if now.timeIntervalSince(lastReconnect) < 8 { return }
+        // Stall (no data) respects a cooldown; invalidSession (-12903) bypasses it
+        // because it often fires just seconds after a prior reconnect yet is the
+        // only way to get a fresh session + IDR. reconnectPending prevents a burst
+        // of -12903 frames from stacking up reconnects.
+        if reason != "invalidSession" && now.timeIntervalSince(lastReconnect) < 8 { return }
         lastReconnect = now
+        reconnectPending = true
         DiagLog.shared.evt("autoReconnect reason=\(reason) gen=\(generation)")
         stats.didReconnect()
         stallWorkItem?.cancel()
@@ -694,7 +704,26 @@ final class VideoPreviewTester: ObservableObject {
         }
         if dst != noErr {
             DiagLog.shared.warn("decodeSubmitFail status=\(dst) frame#\(submitted)")
-            publish { self.lastError = "解码失败：\(dst)" }
+            // kVTInvalidSessionErr (-12903): after the app returns from background,
+            // VideoToolbox invalidates the session. Unlike a bad-data error (-12909),
+            // the session itself is dead — every subsequent submit fails and no callback
+            // ever fires, so the decode-callback path can't detect it. The no-data
+            // watchdog can't help either (TCP keeps streaming). Rebuild the session
+            // right here and go back to waiting for an IDR, so the next keyframe
+            // starts a fresh chain on a live decoder instead of freezing for 20+s.
+            if dst == -12903 {
+                // A bare local session rebuild is not enough: the iPhone won't send
+                // a fresh IDR on demand (static screen may stay on P frames for ages),
+                // so we'd freeze waiting. A reconnect does BOTH — new session AND a
+                // fresh IDR (the server issues forceKeyFrame on client connect), which
+                // is exactly how the log shows the stream recovering every time.
+                DiagLog.shared.warn("invalidSession -12903 -> reconnect for fresh IDR")
+                awaitingKeyframe = true
+                reconnectForRecovery(reason: "invalidSession")
+                publish { self.lastError = "解码会话失效，重连中…" }
+            } else {
+                publish { self.lastError = "解码失败：\(dst)" }
+            }
         }
     }
 
