@@ -72,6 +72,15 @@ struct ContentView: View {
                             }
                         }
                         .disabled(tester.isScanning)
+                        Button(action: {
+                            tester.rtspOptions(interface: candidate.name)
+                        }) {
+                            HStack {
+                                Text("RTSP 握手（发 OPTIONS，验协议对话）")
+                                if tester.isScanning { ProgressView() }
+                            }
+                        }
+                        .disabled(tester.isScanning)
                     } else {
                         Text("没找到 NCM 接口，先跑 CarPlay 再重新扫描")
                             .font(.caption)
