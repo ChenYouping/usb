@@ -501,29 +501,12 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private static func annexBToLengthPrefixed(_ data: Data, lengthSize: Int) -> Data {
-        let b = [UInt8](data)
-        var nalus: [[UInt8]] = []
-        var i = 0
-        func scLen(_ idx: Int) -> Int {
-            if idx + 3 < b.count, b[idx] == 0, b[idx + 1] == 0, b[idx + 2] == 0, b[idx + 3] == 1 { return 4 }
-            if idx + 2 < b.count, b[idx] == 0, b[idx + 1] == 0, b[idx + 2] == 1 { return 3 }
-            return 0
-        }
-        while i < b.count, scLen(i) == 0 { i += 1 }
-        while i < b.count {
-            let sc = scLen(i)
-            if sc == 0 { break }
-            let start = i + sc
-            var end = start
-            var next = start
-            while next + 2 < b.count {
-                if scLen(next) > 0 { end = next; break }
-                next += 1
-            }
-            if end <= start { break }
-            nalus.append(Array(b[start..<end]))
-            i = end
-        }
+        // Reuse splitAnnexB. The previous inline parser initialized end=start, so
+        // when a frame had no further start code it kept end==start and hit
+        // `end <= start { break }`, silently dropping the final NALU — for a
+        // single-NALU frame that discarded the entire picture, leaving frame 0.
+        // splitAnnexB extends the last NALU to the end of the buffer correctly.
+        let nalus = splitAnnexB(data)
         var out = Data()
         for nalu in nalus {
             let len = nalu.count
