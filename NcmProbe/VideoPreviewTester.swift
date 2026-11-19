@@ -44,6 +44,13 @@ final class VideoPreviewTester: ObservableObject {
     // of stale frames flashing by when returning to the foreground.
     private var pendingImage: CVPixelBuffer?
     private var displayRefreshScheduled = false
+    // Stall watchdog: the 7101 push can silently stop (CarPlay session recycled,
+    // screen off) without sending FIN, leaving NWConnection stuck in receive()
+    // and the UI showing "connected" with a frozen frame count. Every received
+    // chunk rearms a timer; if no data arrives for STALL_TIMEOUT sec we reconnect,
+    // which makes the server replay a fresh GOP and resume the stream.
+    private var stallWorkItem: DispatchWorkItem?
+    private static let stallTimeout: Double = 6.0
 
     var isConnected: Bool { connection != nil }
 
@@ -104,6 +111,10 @@ final class VideoPreviewTester: ObservableObject {
                     self.mark("ready - waiting frame")
                     self.clearBuffer()
                     self.receiveMore()
+                    // Start the no-data watchdog now; it is rearmed by every
+                    // received chunk. Reconnects immediately if the server
+                    // stalls before sending the first frame.
+                    self.armStallWatchdog(gen: gen)
                 case .waiting(let err):
                     self.status = "等待网络"
                     self.detail = "\(err)"
@@ -142,6 +153,8 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private func teardownConnection() {
+        stallWorkItem?.cancel()
+        stallWorkItem = nil
         connection?.cancel()
         connection = nil
         if let s = session {
@@ -176,6 +189,8 @@ final class VideoPreviewTester: ObservableObject {
                 self.readQueue.async {
                     self.readBuffer.append(contentsOf: data)
                     self.parseFrames()
+                    // Any inbound data means the stream is alive — rearm watchdog.
+                    self.armStallWatchdog(gen: self.generation)
                 }
             }
             if let error {
@@ -401,15 +416,30 @@ final class VideoPreviewTester: ObservableObject {
         }
     }
 
+    /// (Re)arm the no-data watchdog. Called on every received chunk and once
+    /// right after TCP ready. If nothing arrives within the timeout, reconnect.
+    private func armStallWatchdog(gen: Int) {
+        stallWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, gen == self.generation, self.wanted else { return }
+            DiagLog.shared.line("no data for \(Self.stallTimeout)s -> stall reconnect")
+            self.reconnectForRecovery(reason: "stall")
+        }
+        stallWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.stallTimeout, execute: item)
+    }
+
     /// Silent reconnect (keeps the diagnostic log) used by the decode-error
     /// watchdog. The server replays a fresh GOP on connect, resetting the chain.
-    private func reconnectForRecovery() {
+    private func reconnectForRecovery(reason: String = "decode") {
         guard wanted, !lastInterface.isEmpty else { return }
         let now = Date()
         if now.timeIntervalSince(lastReconnect) < 8 { return }
         lastReconnect = now
-        DiagLog.shared.line("=== auto reconnect (decode watchdog) ===")
+        DiagLog.shared.line("=== auto reconnect (\(reason) watchdog) ===")
         consecutiveDecodeErrors = 0
+        stallWorkItem?.cancel()
+        stallWorkItem = nil
         generation += 1
         let gen = generation
         teardownConnection()
