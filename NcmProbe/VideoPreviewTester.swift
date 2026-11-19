@@ -20,6 +20,7 @@ private final class ProbeStats {
     private var decOK = 0, decFail = 0
     private var shown = 0
     private var reconnect = 0
+    private var idrSeen = 0, dropNoIdr = 0
     private func withLock<T>(_ body: () -> T) -> T {
         lock.lock(); defer { lock.unlock() }; return body()
     }
@@ -34,6 +35,8 @@ private final class ProbeStats {
     func decoded(ok: Bool) { withLock { if ok { decOK += 1 } else { decFail += 1 } } }
     func didShow() { withLock { shown += 1 } }
     func didReconnect() { withLock { reconnect += 1 } }
+    func idr() { withLock { idrSeen += 1 } }
+    func dropped(noIdr: Bool) { withLock { if noIdr { dropNoIdr += 1 } } }
 
     /// Returns the STAT line when the 5 s window elapsed, otherwise nil.
     func flush() -> String? {
@@ -43,15 +46,17 @@ private final class ProbeStats {
             guard span >= 5.0 else { return nil }
             let line = String(format:
                 "PROBE-STAT win=%.1fs in=%dkB parse=%d/%d resync=%d badLen=%d " +
-                "cfg=%d/%d trans=%d/empty%d submit=%d/fail%d dec=%d/fail%d shown=%d recon=%d",
+                "cfg=%d/%d trans=%d/empty%d submit=%d/fail%d dec=%d/fail%d shown=%d recon=%d " +
+                "idr=%d dropNoIdr=%d",
                 span, inBytes / 1024, parsedCfg, parsedFrame, resync, badLen,
                 cfgApplied, cfgFail, transFrames, transEmpty, submitted, submitFail,
-                decOK, decFail, shown, reconnect)
+                decOK, decFail, shown, reconnect, idrSeen, dropNoIdr)
             start = now
             inBytes = 0; parsedCfg = 0; parsedFrame = 0
             resync = 0; badLen = 0; cfgApplied = 0; cfgFail = 0
             transEmpty = 0; transFrames = 0; submitted = 0; submitFail = 0
             decOK = 0; decFail = 0; shown = 0; reconnect = 0
+            idrSeen = 0; dropNoIdr = 0
             return line
         }
     }
@@ -90,6 +95,14 @@ final class VideoPreviewTester: ObservableObject {
     private var submitted = 0          // frames actually handed to the decoder
     private var lastDecodeStatus: OSStatus = 0
     private var callbackCount = 0
+
+    /// IDR-driven decode state. All access is on readQueue except resets done
+    /// inside teardownConnection (also dispatched on readQueue) — see below.
+    /// true  = waiting for an IDR; non-IDR frames are dropped, last image is kept.
+    /// false = decoding a GOP that started at an IDR.
+    private var awaitingKeyframe = true
+    private var lastKeyframeType = ""
+    private var codecByte: UInt8 = 0  // 0 = H264, 1 = H265; set from config frame
     // While the app is backgrounded the main queue is frozen but the decode
     // thread keeps producing frames, so many "latestImage =" closures pile up.
     // Coalesce them: callbacks only overwrite a pending slot, and a single
@@ -117,15 +130,14 @@ final class VideoPreviewTester: ObservableObject {
 
     private func mark(_ s: String) { publish { self.step = s } }
 
-    // Last connected interface, kept so the decode-failure watchdog can reconnect.
+    // Last connected interface, kept so the no-data watchdog can reconnect.
     private var lastInterface: String = ""
-    private var consecutiveDecodeErrors = 0
     private var lastReconnect = Date.distantPast
     private var waitConfigWarnCount = 0
 
     func connect(interface: String) {
         lastInterface = interface
-        consecutiveDecodeErrors = 0
+        awaitingKeyframe = true
         waitConfigWarnCount = 0
         DiagLog.shared.reset()
         DiagLog.shared.evt("connect start iface=\(interface)")
@@ -167,13 +179,13 @@ final class VideoPreviewTester: ObservableObject {
                 case .ready:
                     DiagLog.shared.evt("TCP ready attempt=\(attempt) gen=\(gen)")
                     self.lastError = ""
-                    self.status = "已连接，等待首帧"
-                    self.mark("ready - waiting frame")
+                    self.status = "已连接，等待关键帧"
+                    self.mark("ready - waiting IDR")
+                    self.awaitingKeyframe = true
                     self.clearBuffer()
                     self.receiveMore()
                     // Start the no-data watchdog now; it is rearmed by every
-                    // received chunk. Reconnects immediately if the server
-                    // stalls before sending the first frame.
+                    // received chunk. Reconnects if the stream silently stops.
                     self.armStallWatchdog(gen: gen)
                 case .waiting(let err):
                     self.status = "等待网络"
@@ -229,6 +241,9 @@ final class VideoPreviewTester: ObservableObject {
         submitted = 0
         callbackCount = 0
         pendingImage = nil
+        awaitingKeyframe = true
+        lastKeyframeType = ""
+        codecByte = 0
         clearBuffer()
     }
 
@@ -314,6 +329,7 @@ final class VideoPreviewTester: ObservableObject {
     private func applyConfig(codec: UInt8, data: Data) {
         DiagLog.shared.evt("CONFIG codec=\(codec) bytes=\(data.count)")
         mark("apply config \(data.count)B")
+        codecByte = codec
         // H264 avcC keeps lengthSizeMinusOne at byte 4; H265 hvcC keeps it at
         // byte 21. Reading byte 4 for hvcC returns profile flags -> bogus size 1.
         nalLengthSize = Self.nalLengthSize(from: data, codec: codec)
@@ -456,20 +472,20 @@ final class VideoPreviewTester: ObservableObject {
             tester.callbackCount += 1
             if code != noErr || image == nil {
                 tester.stats.decoded(ok: false)
-                // watchdog: a long unbroken run of decode failures means the
-                // reference chain is broken with no upcoming IDR. Reconnect makes
-                // the server replay a fresh GOP, which self-heals the decoder.
-                tester.consecutiveDecodeErrors += 1
-                if tester.consecutiveDecodeErrors == 1 || tester.consecutiveDecodeErrors % 60 == 0 {
-                    DiagLog.shared.warn("decodeFail status=\(code) streak=\(tester.consecutiveDecodeErrors)")
-                }
-                if tester.consecutiveDecodeErrors == 60 {
-                    tester.reconnectForRecovery(reason: "decode")
+                // IDR-driven recovery: a decode failure means the reference chain
+                // is broken. Do NOT reconnect (there is no server GOP to replay any
+                // more) and do NOT flash stale frames — just drop this frame and
+                // go back to waiting for the next IDR, which rebuilds the session.
+                // This callback runs on main; flip the flag on readQueue so it is
+                // serialized with submitFrame's state access.
+                DiagLog.shared.warn("decodeFail status=\(code) -> await keyframe")
+                tester.readQueue.async {
+                    guard tester.wanted else { return }
+                    tester.awaitingKeyframe = true
                 }
                 return
             }
             tester.stats.decoded(ok: true)
-            tester.consecutiveDecodeErrors = 0
             guard let image else { return }
             // Coalesce: callbacks only overwrite the newest-frame slot. One
             // refresh is scheduled; when the main queue drains (e.g. back from
@@ -520,16 +536,16 @@ final class VideoPreviewTester: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.stallTimeout, execute: item)
     }
 
-    /// Silent reconnect (keeps the diagnostic log) used by the decode-error
-    /// watchdog. The server replays a fresh GOP on connect, resetting the chain.
-    private func reconnectForRecovery(reason: String = "decode") {
+    /// Silent reconnect (keeps the diagnostic log) used only by the no-data
+    /// watchdog now. On reconnect the server sends config and asks the iPhone for
+    /// a fresh IDR; we start decoding when that IDR arrives.
+    private func reconnectForRecovery(reason: String = "stall") {
         guard wanted, !lastInterface.isEmpty else { return }
         let now = Date()
         if now.timeIntervalSince(lastReconnect) < 8 { return }
         lastReconnect = now
         DiagLog.shared.evt("autoReconnect reason=\(reason) gen=\(generation)")
         stats.didReconnect()
-        consecutiveDecodeErrors = 0
         stallWorkItem?.cancel()
         stallWorkItem = nil
         generation += 1
@@ -549,7 +565,7 @@ final class VideoPreviewTester: ObservableObject {
         // build a decoder from SPS/PPS embedded in the stream itself. Harmless if
         // the frame has none — we simply keep waiting for a real config frame.
         if formatDesc == nil { _ = tryAdoptConfigFromFrame(annexb) }
-        guard let desc = formatDesc, let session else {
+        guard let desc = formatDesc, self.session != nil else {
             let kinds = Self.naluTypeSummary(annexb)
             waitConfigWarnCount += 1
             if waitConfigWarnCount == 1 || waitConfigWarnCount % 100 == 0 {
@@ -560,6 +576,39 @@ final class VideoPreviewTester: ObservableObject {
         }
         waitConfigWarnCount = 0
         let kinds = Self.naluTypeSummary(annexb)
+
+        // IDR-driven gate: while waiting for a keyframe, drop every non-IDR frame.
+        // A P frame without its reference IDR decodes to -12909/-17694 and, worse,
+        // poisons the reference chain. We keep the last displayed image (freeze)
+        // instead. When an IDR arrives, rebuild the session so the chain starts clean.
+        let isKey = Self.isKeyframe(annexb, codec: codecByte)
+        if awaitingKeyframe {
+            if !isKey {
+                stats.dropped(noIdr: true)
+                publish { self.detail = "等 IDR…（已丢弃 \(annexb.count)B 非关键帧）" }
+                return
+            }
+            // First IDR of a new chain: reset the decoder so no stale references
+            // from the pre-join stream can poison this GOP.
+            DiagLog.shared.evt("IDR detected \(kinds) bytes=\(annexb.count) -> start decode")
+            stats.idr()
+            lastKeyframeType = kinds
+            awaitingKeyframe = false
+            recreateSession()
+            guard self.session != nil else {
+                DiagLog.shared.warn("IDR session recreate failed -> await keyframe")
+                awaitingKeyframe = true
+                return
+            }
+            mark("IDR - decoding")
+        } else if isKey {
+            // A new IDR mid-stream is a clean GOP boundary; log it but keep the
+            // session (VideoToolbox handles in-band IDR as a reference reset).
+            stats.idr()
+            lastKeyframeType = kinds
+            DiagLog.shared.line("TRACE idr midstream \(kinds) bytes=\(annexb.count)")
+        }
+
         let prefixed = Self.annexBToLengthPrefixed(annexb, lengthSize: nalLengthSize)
         guard !prefixed.isEmpty else {
             stats.transcoded(empty: true)
@@ -625,8 +674,11 @@ final class VideoPreviewTester: ObservableObject {
             publish { self.lastError = "采样缓冲创建失败：\(sst)" }
             return
         }
+        // Re-read self.session: the IDR gate above may have rebuilt it, and the
+        // `session` bound by the earlier guard is a stale snapshot of the old one.
+        guard let decodeSession = self.session else { return }
         let dst = VTDecompressionSessionDecodeFrame(
-            session,
+            decodeSession,
             sampleBuffer: sample,
             flags: [],
             frameRefcon: nil,
@@ -671,6 +723,24 @@ final class VideoPreviewTester: ObservableObject {
             i = end
         }
         return nalus
+    }
+
+    /// True if any NALU in this (Annex-B) frame is a random-access point:
+    /// H264 IDR = type 5; H265 IDR/IRAP = type 16...21 (matches DiPlay's
+    /// MediaCodecSupport.isRandomAccess). Used to gate decoding so we never feed
+    /// a reference-less P frame to VideoToolbox.
+    private static func isKeyframe(_ data: Data, codec: UInt8) -> Bool {
+        for n in splitAnnexB(data) {
+            guard let h = n.first else { continue }
+            if codec == 1 {
+                let t = Int((h >> 1) & 0x3F)
+                if t >= 16 && t <= 21 { return true }
+            } else {
+                let t = Int(h & 0x1F)
+                if t == 5 { return true }
+            }
+        }
+        return false
     }
 
     /// Human-readable NALU type list for diagnostics (H264: type = byte0 & 0x1F;
@@ -744,6 +814,7 @@ final class VideoPreviewTester: ObservableObject {
         }
         guard let desc = out else { return false }
         formatDesc = desc
+        codecByte = isHEVC ? 1 : 0
         recreateSession()
         if session != nil {
             publish { self.detail = "已从帧内参数集恢复解码（\(isHEVC ? "H265" : "H264")）" }
