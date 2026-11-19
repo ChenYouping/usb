@@ -65,7 +65,7 @@ final class VideoPreviewTester: ObservableObject {
                 case .ready:
                     self.status = "已连接，等待首帧"
                     self.mark("ready - waiting frame")
-                    self.readBuffer.removeAll()
+                    self.clearBuffer()
                     self.receiveMore()
                 case .waiting(let err):
                     self.status = "等待网络"
@@ -103,7 +103,14 @@ final class VideoPreviewTester: ObservableObject {
             session = nil
         }
         formatDesc = nil
-        readBuffer.removeAll()
+        clearBuffer()
+    }
+
+    /// All readBuffer mutations must happen on readQueue. This prevents the
+    /// cross-thread race between the main thread (teardown/ready) and the
+    /// receive queue (append/parse) that caused an out-of-bounds trap.
+    private func clearBuffer() {
+        readQueue.async { self.readBuffer.removeAll() }
     }
 
     deinit {
@@ -155,10 +162,11 @@ final class VideoPreviewTester: ObservableObject {
             guard readBuffer.count >= headerSize + length else { break }
             let body = Data(readBuffer[headerSize..<(headerSize + length)])
             readBuffer.removeFirst(headerSize + length)
+            // Already on readQueue; call directly so buffer work stays serialized.
             if kind == 1 {
-                readQueue.async { self.applyConfig(codec: codec, data: body) }
+                applyConfig(codec: codec, data: body)
             } else if kind == 2 {
-                readQueue.async { self.submitFrame(body) }
+                submitFrame(body)
             }
         }
     }
