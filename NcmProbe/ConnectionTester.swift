@@ -84,6 +84,95 @@ final class ConnectionTester: ObservableObject {
         }
     }
 
+    // MARK: - RTSP OPTIONS handshake
+
+    /// Sends a standard RTSP OPTIONS request to DiPlay's AirPlay control port
+    /// and checks for a valid RTSP response line. This proves protocol-level
+    /// conversation, not just TCP reachability. DiPlay echoes CSeq and returns
+    /// 200 for unknown methods, so any well-formed RTSP/1.0 response is a pass.
+    func rtspOptions(interface: String) {
+        cancelAll()
+        let iface = interface.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scopedHost = iface.isEmpty ? Self.diPlayAddress : "\(Self.diPlayAddress)%\(iface)"
+
+        guard iface.isEmpty || if_nametoindex(iface) != 0 else {
+            log = "找不到接口 \(iface)，先在「判定结果」里确认 NCM 接口名"
+            return
+        }
+
+        scanToken += 1
+        let token = scanToken
+        isScanning = true
+        log = "连接 \(scopedHost):7000 并发送 RTSP OPTIONS …\n"
+
+        guard let nwPort = NWEndpoint.Port(rawValue: 7000) else { return }
+        let conn = NWConnection(host: NWEndpoint.Host(scopedHost), port: nwPort, using: .tcp)
+        connections.append(conn)
+
+        // One-shot settlement guarded by token; safe against multiple state fires.
+        let settled = NSLock()
+        var didSettle = false
+        let finish: (String) -> Void = { line in
+            settled.lock()
+            if didSettle { settled.unlock(); return }
+            didSettle = true
+            settled.unlock()
+            DispatchQueue.main.async {
+                guard token == self.scanToken else { return }
+                self.isScanning = false
+                self.log = line
+            }
+        }
+
+        // Timeout: no RTSP answer within 5 seconds counts as failure.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5.0) {
+            finish("timeout：5 秒内没有收到 RTSP 响应。\n可能 CarPlay 画面未出，或 7000 端口不是当前控制端口。")
+        }
+
+        let queue = DispatchQueue(label: "ncmprobe.rtsp")
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                let request = "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: NcmProbe/1.0\r\n\r\n"
+                conn.send(content: request.data(using: .utf8), contentContext: .defaultMessage, isComplete: true, completion: .contentProcessed { sendError in
+                    if let sendError = sendError {
+                        finish("发送 OPTIONS 失败：\(sendError.localizedDescription)")
+                        conn.cancel()
+                        return
+                    }
+                    conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, _, recvError in
+                        if let recvError = recvError {
+                            finish("读取响应失败：\(recvError.localizedDescription)")
+                            return
+                        }
+                        guard let data = data,
+                              let text = String(data: data, encoding: .utf8),
+                              !text.isEmpty else {
+                            finish("对端关闭连接且没有返回任何数据（端口可能只接受系统 CarPlay 会话）。")
+                            return
+                        }
+                        let statusLine = text.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? text
+                        let ok = statusLine.contains("RTSP/") && (statusLine.contains(" 200 ") || statusLine.contains(" 2"))
+                        let cseqEcho = text.localizedCaseInsensitiveContains("cseq")
+                        if ok {
+                            finish("收到 RTSP 响应：\n\(statusLine)\nCSeq 回显：\(cseqEcho ? "有" : "无")\n\n✅ 协议对话成功：App 与 DiPlay 的 AirPlay 控制端口完成了 RTSP 层握手。")
+                        } else {
+                            finish("收到响应但不是预期的 200：\n\(statusLine)\n\n原始内容：\n\(text)")
+                        }
+                        conn.cancel()
+                    }
+                })
+            case .failed(let error):
+                finish("连接失败：\(error.localizedDescription)")
+            case .waiting(let error):
+                finish("等待中（可能是本地网络权限）：\(error.localizedDescription)")
+            default:
+                return
+            }
+        }
+        conn.start(queue: queue)
+    }
+
     // MARK: - Core probe: each connection settles exactly once
 
     private func startProbe(
