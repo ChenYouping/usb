@@ -13,8 +13,7 @@ final class VideoPreviewTester: ObservableObject {
     @Published private(set) var lastError = ""
     @Published private(set) var latestImage: CVPixelBuffer?
     @Published private(set) var step = "idle"
-    /// Decode diagnostics: frames submitted, decode return codes, callback status.
-    @Published private(set) var decodeDiag = ""
+    /// Decode diagnostics go to a shareable log file (see DiagLog), not the UI.
 
     /// The VT callback gets an opaque refCon; using a weak static avoids the
     /// dangling-pointer risk of Unmanaged.passUnretained after invalidation.
@@ -37,8 +36,7 @@ final class VideoPreviewTester: ObservableObject {
     private var frameIndex: Int64 = 0
     private var submitted = 0          // frames actually handed to the decoder
     private var lastDecodeStatus: OSStatus = 0
-    @Published private(set) var callbackCount = 0
-    @Published private(set) var lastCallback = ""
+    private var callbackCount = 0
 
     var isConnected: Bool { connection != nil }
 
@@ -49,6 +47,8 @@ final class VideoPreviewTester: ObservableObject {
     private func mark(_ s: String) { publish { self.step = s } }
 
     func connect(interface: String) {
+        DiagLog.shared.reset()
+        DiagLog.shared.line("=== connect start iface=\(interface) ===")
         disconnect()
         wanted = true
         generation += 1
@@ -84,6 +84,7 @@ final class VideoPreviewTester: ObservableObject {
                 guard gen == self.generation, self.wanted else { return }
                 switch state {
                 case .ready:
+                    DiagLog.shared.line("TCP ready (attempt \(attempt))")
                     self.lastError = ""
                     self.status = "已连接，等待首帧"
                     self.mark("ready - waiting frame")
@@ -94,6 +95,7 @@ final class VideoPreviewTester: ObservableObject {
                     self.detail = "\(err)"
                     self.mark("waiting: \(err)")
                 case .failed(let err):
+                    DiagLog.shared.line("TCP failed attempt \(attempt): \(err)")
                     self.teardownConnection()
                     if attempt + 1 < maxAttempts {
                         self.mark("连接失败，1 秒后重试：\(err)")
@@ -136,7 +138,6 @@ final class VideoPreviewTester: ObservableObject {
         frameIndex = 0
         submitted = 0
         callbackCount = 0
-        lastCallback = ""
         clearBuffer()
     }
 
@@ -211,17 +212,21 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private func applyConfig(codec: UInt8, data: Data) {
+        DiagLog.shared.line("CONFIG frame codec=\(codec) bytes=\(data.count)")
         mark("apply config \(data.count)B")
         // H264 avcC keeps lengthSizeMinusOne at byte 4; H265 hvcC keeps it at
         // byte 21. Reading byte 4 for hvcC returns profile flags -> bogus size 1.
         nalLengthSize = Self.nalLengthSize(from: data, codec: codec)
+        DiagLog.shared.line("  nalLengthSize=\(nalLengthSize)")
         guard let desc = Self.formatDescription(from: data, codec: codec) else {
+            DiagLog.shared.line("  FAIL formatDescription=nil")
             publish { self.lastError = "无法从配置帧构造格式描述" }
             return
         }
         formatDesc = desc
         mark("format desc ok - create session")
         recreateSession()
+        DiagLog.shared.line("  sessionCreated=\(session != nil)")
         if session != nil {
             publish {
                 self.detail = "配置：\(codec == 1 ? "H265" : "H264")，NAL 长度 \(self.nalLengthSize) 字节"
@@ -346,10 +351,10 @@ final class VideoPreviewTester: ObservableObject {
     private let outputCallback: VTDecompressionOutputCallback = { _, _, status, _, image, _, _ in
         let code = status
         let hasImage = image != nil
+        DiagLog.shared.line("DECODE callback status=\(code) image=\(hasImage)")
         guard let tester = VideoPreviewTester.active else { return }
         DispatchQueue.main.async {
             tester.callbackCount += 1
-            tester.lastCallback = "回调#\(tester.callbackCount) status=\(code) 图像=\(hasImage)"
             guard code == noErr, let image else { return }
             tester.latestImage = image
             tester.decodedFrames += 1
@@ -369,7 +374,7 @@ final class VideoPreviewTester: ObservableObject {
         let kinds = Self.naluTypeSummary(annexb)
         let prefixed = Self.annexBToLengthPrefixed(annexb, lengthSize: nalLengthSize)
         guard !prefixed.isEmpty else {
-            publish { self.decodeDiag = "帧转码后为空（\(kinds)）" }
+            DiagLog.shared.line("FRAME transcode EMPTY \(kinds) raw=\(annexb.count)")
             return
         }
 
@@ -439,10 +444,7 @@ final class VideoPreviewTester: ObservableObject {
         )
         submitted += 1
         lastDecodeStatus = dst
-        let sub = submitted, cb = callbackCount, st = dst
-        publish {
-            self.decodeDiag = "已送解码 \(sub) 帧 / 回调 \(cb) 次 / 上次 decode=\(st) / 帧头 \(kinds)"
-        }
+        DiagLog.shared.line("FRAME#\(submitted) \(kinds) prefixed=\(prefixed.count) decode=\(dst) callbacks=\(callbackCount)")
         if dst != noErr { publish { self.lastError = "解码失败：\(dst)" } }
     }
 

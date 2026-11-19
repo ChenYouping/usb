@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var host: String = ""
     @State private var port: String = "7100"
     @State private var showCopied = false
+    @State private var showShareLog = false
     @StateObject private var tester = ConnectionTester()
     @StateObject private var tcpTester = TcpChannelTester()
     @StateObject private var video = VideoPreviewTester()
@@ -174,21 +175,16 @@ struct ContentView: View {
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
-                        if !video.decodeDiag.isEmpty {
-                            Text(video.decodeDiag)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.blue)
-                        }
-                        if !video.lastCallback.isEmpty {
-                            Text(video.lastCallback)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.blue)
-                        }
                         if !video.lastError.isEmpty {
                             Text(video.lastError)
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.red)
                         }
+                        Button("导出诊断日志（发给开发者）") { showShareLog = true }
+                            .font(.caption)
+                            .sheet(isPresented: $showShareLog) {
+                                ActivityView(activityItems: [DiagLog.shared.shareURL()])
+                            }
                         Text("需要把 DiPlay 换成带视频通道的构建版本（端口 7101）；官方 APK 无此端口。点连接后才开始推流，断开即停。")
                             .font(.caption2)
                             .foregroundColor(.secondary)
@@ -236,4 +232,13 @@ struct ContentView: View {
             }
         }
     }
+}
+
+/// Wraps UIKit's system share sheet so the user can send the diagnostic log file.
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

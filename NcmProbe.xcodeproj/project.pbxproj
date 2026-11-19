@@ -13,6 +13,7 @@
 		AA0000000000000000000004 /* ConnectionTester.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000004 /* ConnectionTester.swift */; };
 		AA0000000000000000000007 /* TcpChannelTester.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000007 /* TcpChannelTester.swift */; };
 		AA0000000000000000000008 /* VideoPreviewTester.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000008 /* VideoPreviewTester.swift */; };
+		AA0000000000000000000009 /* DiagLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0000000000000000000009 /* DiagLog.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,6 +23,7 @@
 		BB0000000000000000000004 /* ConnectionTester.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionTester.swift; sourceTree = "<group>"; };
 		BB0000000000000000000007 /* TcpChannelTester.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TcpChannelTester.swift; sourceTree = "<group>"; };
 		BB0000000000000000000008 /* VideoPreviewTester.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPreviewTester.swift; sourceTree = "<group>"; };
+		BB0000000000000000000009 /* DiagLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagLog.swift; sourceTree = "<group>"; };
 		BB0000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		BB0000000000000000000006 /* NcmProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NcmProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -54,6 +56,7 @@
 				BB0000000000000000000004 /* ConnectionTester.swift */,
 				BB0000000000000000000007 /* TcpChannelTester.swift */,
 				BB0000000000000000000008 /* VideoPreviewTester.swift */,
+				BB0000000000000000000009 /* DiagLog.swift */,
 				BB0000000000000000000005 /* Info.plist */,
 			);
 			path = NcmProbe;
@@ -140,6 +143,7 @@
 				AA0000000000000000000004 /* ConnectionTester.swift in Sources */,
 				AA0000000000000000000007 /* TcpChannelTester.swift in Sources */,
 				AA0000000000000000000008 /* VideoPreviewTester.swift in Sources */,
+				AA0000000000000000000009 /* DiagLog.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
