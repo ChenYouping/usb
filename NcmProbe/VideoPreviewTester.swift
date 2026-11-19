@@ -316,8 +316,13 @@ final class VideoPreviewTester: ObservableObject {
     }
 
     private func submitFrame(_ annexb: Data) {
+        // If the one-shot config frame was missed (client connected late), try to
+        // build a decoder from SPS/PPS embedded in the stream itself. Harmless if
+        // the frame has none — we simply keep waiting for a real config frame.
+        if formatDesc == nil { _ = tryAdoptConfigFromFrame(annexb) }
         guard let desc = formatDesc, let session else {
-            publish { self.detail = "等配置帧…（已收 \(annexb.count) 字节）" }
+            let kinds = Self.naluTypeSummary(annexb)
+            publish { self.detail = "等配置帧…（已收 \(annexb.count) 字节，NALU: \(kinds)）" }
             return
         }
         let prefixed = Self.annexBToLengthPrefixed(annexb, lengthSize: nalLengthSize)
@@ -388,6 +393,111 @@ final class VideoPreviewTester: ObservableObject {
             infoFlagsOut: nil
         )
         if dst != noErr { publish { self.lastError = "解码失败：\(dst)" } }
+    }
+
+    /// Split an Annex-B stream into raw NALUs (without start codes).
+    private static func splitAnnexB(_ data: Data) -> [[UInt8]] {
+        let b = [UInt8](data)
+        var nalus: [[UInt8]] = []
+        var i = 0
+        func startCodeLen(_ idx: Int) -> Int {
+            if idx + 3 < b.count, b[idx] == 0, b[idx + 1] == 0, b[idx + 2] == 0, b[idx + 3] == 1 { return 4 }
+            if idx + 2 < b.count, b[idx] == 0, b[idx + 1] == 0, b[idx + 2] == 1 { return 3 }
+            return 0
+        }
+        while i < b.count, startCodeLen(i) == 0 { i += 1 }
+        while i < b.count {
+            let sc = startCodeLen(i)
+            if sc == 0 { break }
+            let start = i + sc
+            var end = b.count
+            var j = start
+            while j + 2 < b.count {
+                if startCodeLen(j) > 0 { end = j; break }
+                j += 1
+            }
+            if end > start { nalus.append(Array(b[start..<end])) }
+            i = end
+        }
+        return nalus
+    }
+
+    /// Human-readable NALU type list for diagnostics (H264: type = byte0 & 0x1F;
+    /// H265: type = (byte0 >> 1) & 0x3F).
+    private static func naluTypeSummary(_ data: Data) -> String {
+        let nalus = splitAnnexB(data)
+        guard !nalus.isEmpty else { return "无起始码" }
+        return nalus.prefix(6).map { n -> String in
+            guard let h = n.first else { return "?" }
+            let t264 = Int(h & 0x1F)
+            let t265 = Int((h >> 1) & 0x3F)
+            return "264t\(t264)/265t\(t265)"
+        }.joined(separator: ",")
+    }
+
+    /// Last-resort config recovery: if we never saw a config frame, look for
+    /// in-band VPS/SPS/PPS NALUs (some encoders repeat them on keyframes) and
+    /// build a CMFormatDescription from those. Returns true on success.
+    private func tryAdoptConfigFromFrame(_ annexb: Data) -> Bool {
+        let nalus = Self.splitAnnexB(annexb)
+        var vps: [[UInt8]] = [], sps: [[UInt8]] = [], pps: [[UInt8]] = []
+        var isHEVC = false
+        for n in nalus {
+            guard let h = n.first else { continue }
+            let t264 = Int(h & 0x1F)
+            let t265 = Int((h >> 1) & 0x3F)
+            if t265 == 32 { isHEVC = true; vps.append(n) }
+            else if t265 == 33 { isHEVC = true; sps.append(n) }
+            else if t265 == 34 { isHEVC = true; pps.append(n) }
+            else if t264 == 7 && !isHEVC { sps.append(n) }
+            else if t264 == 8 && !isHEVC { pps.append(n) }
+        }
+        guard !sps.isEmpty, !pps.isEmpty else { return false }
+        let sets = (isHEVC ? vps : []) + sps + pps
+        var contiguous = Data()
+        var offsets: [(Int, Int)] = []
+        for s in sets {
+            offsets.append((contiguous.count, s.count))
+            contiguous.append(contentsOf: s)
+        }
+        let headerLength = Int32(nalLengthSize)
+        let storage = contiguous as NSData
+        let base = storage.bytes.assumingMemoryBound(to: UInt8.self)
+        var pointers: [UnsafePointer<UInt8>] = offsets.map { base + $0.0 }
+        let sizes = offsets.map { $0.1 }
+        var out: CMFormatDescription?
+        pointers.withUnsafeMutableBufferPointer { pp in
+            sizes.withUnsafeBufferPointer { ss in
+                guard let ptr = pp.baseAddress, let sz = ss.baseAddress else { return }
+                if isHEVC {
+                    _ = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: sets.count,
+                        parameterSetPointers: UnsafePointer(ptr),
+                        parameterSetSizes: sz,
+                        nalUnitHeaderLength: headerLength,
+                        extensions: nil,
+                        formatDescriptionOut: &out
+                    )
+                } else {
+                    _ = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: sets.count,
+                        parameterSetPointers: UnsafePointer(ptr),
+                        parameterSetSizes: sz,
+                        nalUnitHeaderLength: headerLength,
+                        formatDescriptionOut: &out
+                    )
+                }
+            }
+        }
+        guard let desc = out else { return false }
+        formatDesc = desc
+        recreateSession()
+        if session != nil {
+            publish { self.detail = "已从帧内参数集恢复解码（\(isHEVC ? "H265" : "H264")）" }
+        }
+        return session != nil
     }
 
     private static func annexBToLengthPrefixed(_ data: Data, lengthSize: Int) -> Data {
